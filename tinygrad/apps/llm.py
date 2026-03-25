@@ -61,8 +61,15 @@ class SimpleTokenizer:
     return self.encode("<|start_header_id|>" + role + "<|end_header_id|>\n\n")
   def end_turn(self, eos_id:int):
     if self.preset == 'olmo': return self.encode("\n")
-    if self.preset in ('qwen2', 'kimi-k2'): return [eos_id] + self.encode("\n")
+    if self.preset == 'kimi-k2': return [eos_id]
+    if self.preset == 'qwen2': return [eos_id] + self.encode("\n")
     return [eos_id]
+  @property
+  def default_system_prompt(self) -> str|None:
+    if self.preset == 'kimi-k2': return "You are a helpful assistant"
+    return None
+  @property
+  def add_bos(self) -> bool: return self.preset != 'kimi-k2'
 
 @functools.cache
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
@@ -151,14 +158,16 @@ class TransformerBlock:
     x_norm = self.attn_norm(x)
 
     if c.kv_lora_rank > 0:  # MLA with absorption optimization
+      def rope_interleaved(x, freqs):  # DeepSeek2 uses ROPE_TYPE_NORM (interleaved pairs)
+        return apply_rope(x.rearrange("... (d two) -> ... (two d)", two=2), freqs).rearrange("... (two d) -> ... (d two)", two=2)
       q = self.attn_q(x_norm).reshape(B, T, c.n_heads, c.qk_nope_head_dim + c.qk_rope_head_dim).transpose(1, 2)
       q_nope, q_rope = q[..., :c.qk_nope_head_dim], q[..., c.qk_nope_head_dim:]
-      q_rope = apply_rope(q_rope, self.freqs_cis[start_pos:start_pos+T])
+      q_rope = rope_interleaved(q_rope, self.freqs_cis[start_pos:start_pos+T])
       q_nope = q_nope @ self.attn_k_b_weight.transpose(-1, -2)  # absorb into compressed space
 
       kv_a = self.attn_kv_a_mqa(x_norm)
       c_kv, k_rope = self.attn_kv_a_norm(kv_a[..., :c.kv_lora_rank]), kv_a[..., c.kv_lora_rank:]
-      k_rope = apply_rope(k_rope.reshape(B, T, 1, c.qk_rope_head_dim).transpose(1, 2), self.freqs_cis[start_pos:start_pos+T])
+      k_rope = rope_interleaved(k_rope.reshape(B, T, 1, c.qk_rope_head_dim).transpose(1, 2), self.freqs_cis[start_pos:start_pos+T])
 
       # cache: K=concat(compressed, rope), V=compressed (padded to match K dim for Tensor.stack)
       k_store = c_kv.reshape(B, 1, T, c.kv_lora_rank).cat(k_rope.reshape(B, 1, T, c.qk_rope_head_dim), dim=-1)
@@ -217,10 +226,12 @@ class TransformerBlock:
   def __call__(self, x: Tensor, start_pos: int|UOp):
     if not hasattr(self, "cache_kv"):
       c = self.config
-      kv_heads, kv_dim, rope_dim = (1, c.kv_lora_rank + c.qk_rope_head_dim, c.qk_rope_head_dim) if c.kv_lora_rank > 0 \
-        else (c.n_kv_heads, c.head_dim, c.head_dim)
-      self.cache_kv = Tensor.empty(2, x.shape[0], kv_heads, c.max_context, kv_dim, device=x.device)
-      self.freqs_cis = precompute_freqs_cis(rope_dim, c.max_context, c.rope_theta)
+      if c.kv_lora_rank > 0:
+        self.cache_kv = Tensor.empty(2, x.shape[0], 1, c.max_context, c.kv_lora_rank + c.qk_rope_head_dim, device=x.device)
+        self.freqs_cis = precompute_freqs_cis(c.qk_rope_head_dim, c.max_context, c.rope_theta)
+      else:
+        self.cache_kv = Tensor.empty(2, x.shape[0], c.n_kv_heads, c.max_context, c.head_dim, device=x.device)
+        self.freqs_cis = precompute_freqs_cis(c.head_dim, c.max_context, c.rope_theta)
     # we pass in the weights implicitly so we unpack the GGUF on the fly
     @function(precompile=True, allow_implicit=True)
     def _run(x:Tensor, start_pos:int|UOp): return self._feed_forward(self._attention(x, start_pos)).contiguous()
@@ -285,7 +296,7 @@ class Transformer:
       rope_theta=kv[f'{arch}.rope.freq_base'], max_context=max_context,
       qk_norm=int(state_dict['blk.0.attn_q_norm.weight'].shape[0]) if 'blk.0.attn_q_norm.weight' in state_dict else 0,
       num_experts=kv.get(f'{arch}.expert_count', 0), num_experts_per_tok=kv.get(f'{arch}.expert_used_count', 0),
-      norm_topk_prob=arch in ('qwen3moe', 'deepseek2'),
+      norm_topk_prob=kv.get(f'{arch}.expert_weights_norm', arch == 'qwen3moe'),
       kv_lora_rank=kv_lora_rank,
       qk_nope_head_dim=kv.get(f'{arch}.attention.key_length_mla', 0) - kv.get(f'{arch}.rope.dimension_count', 0) if kv_lora_rank else 0,
       qk_rope_head_dim=kv.get(f'{arch}.rope.dimension_count', 0) if kv_lora_rank else 0,
@@ -412,8 +423,11 @@ class Handler(HTTPRequestHandler):
     if DEBUG >= 1: print(json.dumps(body, indent=2))
     if self.path == "/v1/chat/completions":
       # extract tokens, last assistant message is treated as prefill
-      ids: list[int] = [bos_id] if bos_id is not None else []
-      for i, msg in enumerate(body["messages"]):
+      ids: list[int] = [bos_id] if bos_id is not None and tok.add_bos else []
+      messages = body["messages"]
+      if tok.default_system_prompt and (not messages or messages[0]["role"] != "system"):
+        messages = [{"role": "system", "content": tok.default_system_prompt}] + messages
+      for i, msg in enumerate(messages):
         ids += tok.role(msg["role"])
         content = msg["content"]
         if isinstance(content, str): ids += tok.encode(content)
@@ -483,7 +497,8 @@ if __name__ == "__main__":
     TCPServerWithReuse(('', args.serve), Handler).serve_forever()
 
   # interactive chat
-  ids: list[int] = [bos_id] if bos_id is not None else []
+  ids: list[int] = [bos_id] if bos_id is not None and tok.add_bos else []
+  if tok.default_system_prompt: ids += tok.role("system") + tok.encode(tok.default_system_prompt) + tok.end_turn(eos_id)
   while 1:
     try:
       ids += tok.role("user") + tok.encode(input('>>> ')) + tok.end_turn(eos_id) + tok.role("assistant")
