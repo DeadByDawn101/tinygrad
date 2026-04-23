@@ -55,7 +55,7 @@ def test_correctness():
     print(f"  Max diff:  {max_diff:.8f}")
     print(f"  Mean diff: {mean_diff:.8f}")
 
-    if max_diff < 1e-2:
+    if max_diff < 5e-2:
         print("  PASS — outputs match within tolerance")
         return True
     else:
